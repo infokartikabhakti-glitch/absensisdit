@@ -340,6 +340,11 @@
       <!-- ADMIN: KELOLA AKUN -->
       <section class="view" id="view-akun">
         <div class="card">
+          <h2>🔑 Sandi Admin (Saya)</h2>
+          <p class="sub">Ubah sandi login untuk akun admin yang sedang Anda pakai</p>
+          <button class="btn-primary" id="btnChangeAdminPw" type="button">Ubah Sandi Saya</button>
+        </div>
+        <div class="card">
           <h2>➕ Tambah Akun Guru</h2>
           <p class="sub">Buat akun baru beserta sandi awal untuk guru</p>
           <div class="acc-form">
@@ -502,58 +507,86 @@
     try{ const k='__test__'; localStorage.setItem(k,'1'); localStorage.removeItem(k); return true; }
     catch(e){ return false; }
   }
-  async function storageGet(key){
-    // Cloud (Google Sheet) adalah sumber data utama kalau dikonfigurasi,
-    // supaya semua HP melihat data yang sama.
-    const cloudVal=await cloudGet(key);
-    if(cloudVal!==undefined){
-      if(cloudVal && hasLocalStorage()){ try{ localStorage.setItem(key, cloudVal); }catch(e){} }
-      if(cloudVal) return cloudVal;
+  // Setiap data disimpan dengan bungkus {ts, data}. "ts" = kapan data itu
+  // terakhir disimpan. Dengan begini, saat memuat data dari beberapa sumber
+  // (localStorage HP ini, window.storage, Google Sheet), kita SELALU pakai
+  // salinan yang paling BARU (ts terbesar) — bukan sekadar salinan cloud
+  // mana pun yang berhasil dibaca. Ini mencegah data yang baru saja
+  // ditambahkan (mis. akun guru baru) tertimpa oleh salinan cloud yang
+  // ternyata basi/gagal tersimpan sebelumnya, yang sebelumnya menyebabkan
+  // data hilang saat keluar-masuk aplikasi.
+  function parseStamped(raw){
+    if(!raw) return null;
+    try{
+      const obj=JSON.parse(raw);
+      if(obj && typeof obj==='object' && !Array.isArray(obj) && 'ts' in obj && 'data' in obj){
+        return {ts:Number(obj.ts)||0, data:obj.data};
+      }
+      // Format lama (tanpa timestamp, mis. dari versi aplikasi sebelumnya) → anggap paling lama.
+      return {ts:0, data:obj};
+    }catch(e){ return null; }
+  }
+  async function storageGetStamped(key){
+    const results=[];
+    if(hasLocalStorage()){
+      try{ const p=parseStamped(localStorage.getItem(key)); if(p) results.push(p); }catch(e){}
     }
     if(hasCloudStorage()){
       try{
         const res=await window.storage.get(key, true);
-        if(res && res.value) return res.value;
-      }catch(e){ /* lanjut coba localStorage */ }
+        const p=parseStamped(res && res.value);
+        if(p) results.push(p);
+      }catch(e){ /* abaikan, lanjut sumber lain */ }
     }
-    if(hasLocalStorage()){
-      try{ return localStorage.getItem(key); }catch(e){ return null; }
+    if(hasCloudSync()){
+      try{ const p=parseStamped(await cloudGet(key)); if(p) results.push(p); }catch(e){}
     }
-    return null;
+    if(results.length===0) return null;
+    results.sort((a,b)=> b.ts - a.ts);
+    const winner=results[0];
+    const isStale = results.some(r=> r.ts < winner.ts);
+    return {ts:winner.ts, data:winner.data, needsReconcile:isStale};
   }
-  async function storageSet(key, value){
+  async function storageSetStamped(key, data, ts){
+    ts = ts || Date.now();
+    const raw=JSON.stringify({ts, data});
     let savedAnywhere=false;
     if(hasLocalStorage()){
-      try{ localStorage.setItem(key, value); savedAnywhere=true; }catch(e){ /* abaikan */ }
+      try{ localStorage.setItem(key, raw); savedAnywhere=true; }catch(e){ /* abaikan */ }
     }
-    const cloudOk=await cloudSet(key, value);
-    if(cloudOk) savedAnywhere=true;
     if(hasCloudStorage()){
-      try{ await window.storage.set(key, value, true); savedAnywhere=true; }catch(e){ /* abaikan */ }
+      try{ await window.storage.set(key, raw, true); savedAnywhere=true; }catch(e){ /* abaikan */ }
     }
+    const cloudOk=await cloudSet(key, raw);
+    if(cloudOk) savedAnywhere=true;
     return savedAnywhere;
   }
 
   async function loadAccounts(){
     try{
-      const val=await storageGet(ACC_KEY);
-      const loaded = val ? JSON.parse(val) : [];
-      if(loaded && loaded.length>0){ accounts=loaded; }
+      const res=await storageGetStamped(ACC_KEY);
+      if(res && Array.isArray(res.data) && res.data.length>0){
+        accounts=res.data;
+        if(res.needsReconcile){ await storageSetStamped(ACC_KEY, accounts, res.ts); } // samakan semua sumber
+      }
       else{ await saveAccounts(); } // simpan default agar tersedia di perangkat ini
     }catch(e){ /* tetap pakai DEFAULT_ACCOUNTS */ }
   }
   async function saveAccounts(){
-    const ok=await storageSet(ACC_KEY, JSON.stringify(accounts));
+    const ok=await storageSetStamped(ACC_KEY, accounts, Date.now());
     if(!ok) showToast('Gagal menyimpan perubahan di perangkat ini', true);
   }
   async function loadRecords(){
     try{
-      const val=await storageGet(REC_KEY);
-      records = val ? JSON.parse(val) : [];
+      const res=await storageGetStamped(REC_KEY);
+      if(res && Array.isArray(res.data)){
+        records=res.data;
+        if(res.needsReconcile){ await storageSetStamped(REC_KEY, records, res.ts); }
+      } else { records=[]; }
     }catch(e){ records=[]; }
   }
   async function saveRecords(){
-    const ok=await storageSet(REC_KEY, JSON.stringify(records));
+    const ok=await storageSetStamped(REC_KEY, records, Date.now());
     if(!ok) showToast('Gagal menyimpan data di perangkat ini', true);
   }
 
@@ -714,7 +747,7 @@
   function getTodayRecord(){
     const key=todayKey();
     let rec=records.find(r=>r.date===key && r.userId===currentUser.id);
-    if(!rec){ rec={id:currentUser.id+'-'+key, userId:currentUser.id, date:key, timeMasuk:null, timePulang:null, noteMasuk:'', notePulang:'', locMasuk:null, locPulang:null}; records.push(rec); }
+    if(!rec){ rec={id:currentUser.id+'-'+key, userId:currentUser.id, date:key, timeMasuk:null, timePulang:null, noteMasuk:'', notePulang:'', locMasuk:null, locPulang:null, fotoMasuk:null, fotoPulang:null}; records.push(rec); }
     return rec;
   }
   function renderTodayStatus(){
@@ -740,6 +773,7 @@
     rec.timeMasuk=pad(now.getHours())+':'+pad(now.getMinutes());
     rec.noteMasuk=document.getElementById('notes').value.trim();
     rec.locMasuk=currentLoc;
+    rec.fotoMasuk=capturedPhoto;
     await saveRecords(); renderTodayStatus(); showToast('Presensi Masuk tersimpan — '+rec.timeMasuk);
   });
   document.getElementById('btnPulang').addEventListener('click', async ()=>{
@@ -747,6 +781,7 @@
     rec.timePulang=pad(now.getHours())+':'+pad(now.getMinutes());
     rec.notePulang=document.getElementById('notes').value.trim();
     rec.locPulang=currentLoc;
+    rec.fotoPulang=capturedPhoto;
     await saveRecords(); renderTodayStatus(); showToast('Presensi Pulang tersimpan — '+rec.timePulang);
   });
 
@@ -757,10 +792,16 @@
     if(mine.length===0){ list.innerHTML='<div class="empty"><div class="ic">🗂️</div><p>Belum ada data kehadiran.</p></div>'; return; }
     list.innerHTML=mine.map(r=>{
       const note=[r.noteMasuk, r.notePulang].filter(Boolean).join(' · ');
+      const fotoRow = (r.fotoMasuk || r.fotoPulang) ? (
+        '<div class="rec-fotos" style="display:flex;gap:8px;margin-top:8px;">'
+        + (r.fotoMasuk ? '<a href="'+r.fotoMasuk+'" target="_blank" title="Swafoto Masuk"><img src="'+r.fotoMasuk+'" style="width:48px;height:48px;object-fit:cover;border-radius:8px;"></a>' : '')
+        + (r.fotoPulang ? '<a href="'+r.fotoPulang+'" target="_blank" title="Swafoto Pulang"><img src="'+r.fotoPulang+'" style="width:48px;height:48px;object-fit:cover;border-radius:8px;"></a>' : '')
+        + '</div>'
+      ) : '';
       return '<div class="rec-card"><div class="rec-top"><span class="rec-date">'+fmtDate(r.date)+'</span></div>'
         +'<div class="rec-times"><div class="rec-time"><div class="l">Masuk</div><div class="v">'+(r.timeMasuk||'—')+'</div></div>'
         +'<div class="rec-time"><div class="l">Pulang</div><div class="v">'+(r.timePulang||'—')+'</div></div></div>'
-        + (note ? '<div class="rec-note">'+escapeHtml(note)+'</div>' : '') + '</div>';
+        + (note ? '<div class="rec-note">'+escapeHtml(note)+'</div>' : '') + fotoRow + '</div>';
     }).join('');
   }
   document.getElementById('btnDownloadMine').addEventListener('click', ()=>{
@@ -771,12 +812,12 @@
   });
 
   function downloadCsv(rows, filename){
-    let csv='Nama,Tanggal,Jam Masuk,Jam Pulang,Lokasi Masuk,Lokasi Pulang,Catatan Masuk,Catatan Pulang\n';
+    let csv='Nama,Tanggal,Jam Masuk,Jam Pulang,Lokasi Masuk,Lokasi Pulang,Catatan Masuk,Catatan Pulang,Foto Masuk,Foto Pulang\n';
     rows.forEach(r=>{
       const acc=accounts.find(a=>a.id===r.userId);
       const locM=r.locMasuk ? (r.locMasuk.lat+' '+r.locMasuk.lng) : '';
       const locP=r.locPulang ? (r.locPulang.lat+' '+r.locPulang.lng) : '';
-      const row=[acc?acc.name:r.userId, r.date, r.timeMasuk||'', r.timePulang||'', locM, locP, r.noteMasuk||'', r.notePulang||'']
+      const row=[acc?acc.name:r.userId, r.date, r.timeMasuk||'', r.timePulang||'', locM, locP, r.noteMasuk||'', r.notePulang||'', r.fotoMasuk?'Ada':'-', r.fotoPulang?'Ada':'-']
         .map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',');
       csv+=row+'\n';
     });
@@ -807,9 +848,11 @@
       const rec=records.find(r=>r.userId===a.id && r.date===key);
       const isHadir=!!(rec && rec.timeMasuk);
       if(isHadir) hadir++;
+      const foto = (rec && rec.fotoMasuk) ? '<a href="'+rec.fotoMasuk+'" target="_blank" title="Lihat swafoto"><img src="'+rec.fotoMasuk+'" style="width:32px;height:32px;object-fit:cover;border-radius:6px;margin-right:6px;"></a>' : '';
       return '<div class="rekap-row">'
         +'<div class="avatar-mini">'+initials(a.name)+'</div>'
         +'<div class="rekap-info"><div class="n">'+escapeHtml(a.name)+'</div><div class="t">'+(isHadir ? ('Masuk '+rec.timeMasuk+(rec.timePulang?(' · Pulang '+rec.timePulang):'')) : 'Belum presensi')+'</div></div>'
+        +foto
         +'<span class="status-dot '+(isHadir?'hadir':'belum')+'">'+(isHadir?'Hadir':'Belum')+'</span>'
         +'</div>';
     }).join('');
@@ -861,6 +904,9 @@
     showToast('Akun '+name+' berhasil dibuat');
   });
 
+  document.getElementById('btnChangeAdminPw').addEventListener('click', ()=>{
+    if(currentUser) openPwModal(currentUser.id);
+  });
   let pwModalTargetId=null;
   function openPwModal(id){
     const acc=accounts.find(a=>a.id===id);
